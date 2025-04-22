@@ -1,5 +1,5 @@
 ;; Blockchain Validator Network Reputation System
-;; v0.2 - Network validation tasks and submissions
+;; v1.0 - A protocol for tracking validator performance, rewarding accurate block validation, and maintaining network integrity
 
 ;; Constants
 (define-constant ERR-NOT-NETWORK-CONTROLLER (err u1))
@@ -7,6 +7,7 @@
 (define-constant ERR-INVALID-VALIDATION (err u3))
 (define-constant ERR-VALIDATION-ALREADY-VERIFIED (err u4))
 (define-constant ERR-INCORRECT-VALIDATION-PROOF (err u5))
+(define-constant ERR-VERIFICATION-WINDOW-ACTIVE (err u6))
 (define-constant ERR-INSUFFICIENT-STAKE (err u7))
 (define-constant ERR-INVALID-PARAMETER (err u8))
 (define-constant ERR-VALIDATION-EXISTS (err u9))
@@ -18,7 +19,7 @@
 (define-data-var current-epoch uint u0)
 (define-data-var staking-requirement uint u1000000) ;; 1 STX
 (define-data-var total-rewards-pool uint u0)
-(define-data-var latest-network-block uint u0) ;; Block height tracking
+(define-data-var latest-network-block uint u0) ;; Block height tracking for verification windows
 
 ;; Validation Task Structure
 (define-map validation-tasks
@@ -26,6 +27,7 @@
     {
         block-hash: (string-utf8 256),
         expected-result-hash: (buff 32),  ;; SHA256 hash of the expected validation result
+        verification-time: uint,          ;; Verification time (block height)
         reward: uint,
         verified: bool
     }
@@ -36,6 +38,7 @@
     principal
     {
         active-task: uint,
+        correct-validations: (list 20 uint),
         last-validation: uint,
         total-correct: uint
     }
@@ -46,8 +49,14 @@
     {task-id: uint, validator: principal}
     {
         submissions: uint,
-        verified: bool
+        verified-at: (optional uint)
     }
+)
+
+;; Events
+(define-map verification-history
+    uint
+    (list 10 {validator: principal, verified-block: uint})
 )
 
 ;; Authorization
@@ -82,6 +91,7 @@
     (task-id uint)
     (block-hash (string-utf8 256))
     (expected-result-hash (buff 32))
+    (verification-time uint)
     (reward uint))
     (begin
         (asserts! (is-controller) ERR-NOT-NETWORK-CONTROLLER)
@@ -91,6 +101,9 @@
         
         ;; Check if task already exists to prevent overwriting
         (asserts! (is-none (map-get? validation-tasks task-id)) ERR-VALIDATION-EXISTS)
+        
+        ;; Validate verification time is in the future
+        (asserts! (>= verification-time (var-get latest-network-block)) ERR-INVALID-PARAMETER)
         
         ;; Validate expected result hash is not empty
         (asserts! (> (len expected-result-hash) u0) ERR-INVALID-PARAMETER)
@@ -106,6 +119,7 @@
             {
                 block-hash: block-hash,
                 expected-result-hash: expected-result-hash,
+                verification-time: verification-time,
                 reward: reward,
                 verified: false
             })
@@ -128,6 +142,7 @@
         (map-set validator-records tx-sender
             {
                 active-task: u0,
+                correct-validations: (list),
                 last-validation: u0,
                 total-correct: u0
             })
@@ -144,6 +159,7 @@
         )
         ;; Check task availability
         (asserts! (var-get network-status) ERR-NETWORK-PAUSED)
+        (asserts! (>= current-block (get verification-time task)) ERR-VERIFICATION-WINDOW-ACTIVE)
         (asserts! (not (get verified task)) ERR-VALIDATION-ALREADY-VERIFIED)
         
         ;; Verify validation proof - directly compare the hashes
@@ -157,6 +173,9 @@
                 (map-set validator-records tx-sender
                     (merge validator {
                         active-task: (+ task-id u1),
+                        correct-validations: (unwrap! (as-max-len? 
+                            (append (get correct-validations validator) task-id) u20)
+                            ERR-INVALID-VALIDATION),
                         last-validation: current-block,
                         total-correct: (+ (get total-correct validator) u1)
                     }))
@@ -166,21 +185,51 @@
                     {task-id: task-id, validator: tx-sender}
                     {
                         submissions: u1,
-                        verified: true
+                        verified-at: (some current-block)
                     })
                 
                 ;; Distribute reward
                 (try! (stx-transfer? (get reward task) (var-get network-controller) tx-sender))
                 
+                ;; Record verification
+                (match (map-get? verification-history task-id)
+                    history (map-set verification-history task-id
+                        (unwrap! (as-max-len?
+                            (append history {validator: tx-sender, verified-block: current-block})
+                            u10)
+                            ERR-INVALID-VALIDATION))
+                    (map-set verification-history task-id
+                        (list {validator: tx-sender, verified-block: current-block})))
+                
                 (ok true))
             ERR-INCORRECT-VALIDATION-PROOF)))
 
+;; Network Management Functions
+(define-public (update-staking-requirement (new-requirement uint))
+    (begin
+        (asserts! (is-controller) ERR-NOT-NETWORK-CONTROLLER)
+        (var-set staking-requirement new-requirement)
+        (ok true)))
+
+(define-public (advance-epoch)
+    (begin
+        (asserts! (is-controller) ERR-NOT-NETWORK-CONTROLLER)
+        (var-set current-epoch (+ (var-get current-epoch) u1))
+        (ok true)))
+
 ;; Read-only functions
 (define-read-only (get-task-details (task-id uint))
-    (map-get? validation-tasks task-id))
+    (match (map-get? validation-tasks task-id)
+        task (if (>= (var-get latest-network-block) (get verification-time task))
+            (ok (get block-hash task))
+            ERR-VERIFICATION-WINDOW-ACTIVE)
+        ERR-INVALID-VALIDATION))
 
 (define-read-only (get-validator-profile (validator principal))
     (map-get? validator-records validator))
+
+(define-read-only (get-verification-data (task-id uint))
+    (map-get? verification-history task-id))
 
 (define-read-only (get-current-block)
     (var-get latest-network-block))
@@ -193,9 +242,3 @@
         staking-requirement: (var-get staking-requirement),
         latest-network-block: (var-get latest-network-block)
     })
-
-(define-public (update-staking-requirement (new-requirement uint))
-    (begin
-        (asserts! (is-controller) ERR-NOT-NETWORK-CONTROLLER)
-        (var-set staking-requirement new-requirement)
-        (ok true)))
